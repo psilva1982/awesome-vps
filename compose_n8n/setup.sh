@@ -12,8 +12,10 @@
 #   bash setup.sh
 #
 # O script baixa apenas o conteúdo de compose_n8n/ para /opt/awesome-vps-n8n
-# e se re-executa de lá. É idempotente: re-executar reaproveita as respostas
-# salvas e não sobrescreve o .env sem confirmação.
+# (root) ou ~/.local/share/awesome-vps-n8n (usuário sem sudo, desde que
+# tenha permissão para usar o Docker — grupo 'docker') e se re-executa de
+# lá. É idempotente: re-executar reaproveita as respostas salvas e não
+# sobrescreve o .env sem confirmação.
 #
 # POSIX Note: This script currently relies on bash-specific features (arrays,
 # [[ ]], process substitution). For strict POSIX compliance (posix-shell-pro),
@@ -24,10 +26,19 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 
 readonly REPO_TARBALL_URL="https://github.com/psilva1982/awesome-vps/archive/refs/heads/main.tar.gz"
-readonly INSTALL_DIR="/opt/awesome-vps-n8n"
+# Diretório de instalação: em /opt (todo o sistema) quando executado como
+# root; sob o HOME do usuário quando executado sem sudo — assim o script
+# funciona (e o bootstrap consegue escrever) com ou sem root, e não deixa um
+# ${INSTALL_DIR} de propriedade de root bloqueando execuções futuras como
+# usuário normal.
+if [[ "$EUID" -eq 0 ]]; then
+    readonly INSTALL_DIR="/opt/awesome-vps-n8n"
+else
+    readonly INSTALL_DIR="${HOME}/.local/share/awesome-vps-n8n"
+fi
 # Nome do projeto compose (ver 'name:' em docker-compose.yml) — usado no purge
 # como fallback quando o docker-compose.yml não está disponível localmente.
 readonly COMPOSE_PROJECT_NAME="workflow"
@@ -51,6 +62,7 @@ POSTGRES_PASSWORD=""
 QUEUE_BULL_REDIS_HOST=""
 QUEUE_BULL_REDIS_PORT=""
 QUEUE_BULL_REDIS_PASSWORD=""
+N8N_ENCRYPTION_KEY=""
 
 usage() {
 cat <<EOF
@@ -66,7 +78,9 @@ As respostas ficam em ${COMPOSE_DIR:-<repo>/compose_n8n}/.setup.conf e são
 reaproveitadas em re-execuções.
 
 Pré-requisitos: Docker + plugin 'docker compose', e uma rede docker externa
-chamada 'traefik_public' apontando para um Traefik já em produção.
+chamada 'traefik_public' apontando para um Traefik já em produção. Não exige
+root: funciona com um usuário comum que esteja no grupo 'docker' (o
+diretório de instalação e os arquivos de estado seguem esse usuário).
 
 OPÇÕES:
   -h, --help        Ajuda
@@ -169,6 +183,18 @@ bootstrap_if_needed() {
         exit 1
     fi
 
+    # ${INSTALL_DIR} pode ter sido criado por outro usuário (ex.: root, via
+    # sudo, em execução anterior); escrever nele como usuário diferente
+    # falha com permissão negada. Detecta e orienta em vez de deixar o tar
+    # falhar com um erro críptico.
+    if [[ -e "$INSTALL_DIR" && ! -w "$INSTALL_DIR" ]]; then
+        log_error "${INSTALL_DIR} existe mas não pode ser escrito pelo usuário atual ($(whoami))."
+        log_error "Provavelmente foi criado por outro usuário (ex.: root, via sudo) em execução anterior."
+        log_error "Ajuste a posse com: sudo chown -R \"\$(id -u):\$(id -g)\" \"${INSTALL_DIR}\""
+        log_error "ou remova o diretório (sudo rm -rf \"${INSTALL_DIR}\") e re-execute."
+        exit 1
+    fi
+
     mkdir -p "$INSTALL_DIR"
     curl -fsSL "$REPO_TARBALL_URL" | tar -xz --wildcards --strip-components=2 -C "$INSTALL_DIR" '*/compose_n8n/*'
     chmod +x "${INSTALL_DIR}/"*.sh
@@ -176,6 +202,24 @@ bootstrap_if_needed() {
     REPO_DIR="$INSTALL_DIR"
     log_info "compose_n8n/ extraído. Re-executando de ${INSTALL_DIR}..."
     exec bash "${INSTALL_DIR}/setup.sh" "$@"
+}
+
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# .setup.conf/.env podem ter sido criados por outro usuário (ex.: root, via
+# sudo) em execução anterior; escrever neles como usuário diferente falha
+# com permissão negada. Detecta e orienta em vez de deixar 'set -e' matar o
+# script com um erro críptico no meio de uma etapa.
+check_state_files_writable() {
+    local f
+    for f in "$SETUP_CONF" "$ENV_FILE"; do
+        if [[ -e "$f" && ! -w "$f" ]]; then
+            log_error "'${f}' existe mas não pode ser escrito pelo usuário atual ($(whoami))."
+            log_error "Provavelmente foi criado por outro usuário (ex.: root, via sudo) em execução anterior."
+            log_error "Ajuste a posse com: sudo chown \"\$(id -u):\$(id -g)\" \"${f}\""
+            exit 1
+        fi
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -220,6 +264,7 @@ POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
 QUEUE_BULL_REDIS_HOST="${QUEUE_BULL_REDIS_HOST}"
 QUEUE_BULL_REDIS_PORT="${QUEUE_BULL_REDIS_PORT}"
 QUEUE_BULL_REDIS_PASSWORD="${QUEUE_BULL_REDIS_PASSWORD}"
+N8N_ENCRYPTION_KEY="${N8N_ENCRYPTION_KEY}"
 EOF
     log_info "Respostas salvas em ${SETUP_CONF}"
 }
@@ -291,22 +336,47 @@ step_inputs() {
 }
 
 # ------------------------------------------------------------------------------
-# Reaproveita N8N_ENCRYPTION_KEY de um .env existente; gera uma nova só na
-# primeira execução (a chave NUNCA pode mudar depois de criada).
+# Reaproveita N8N_ENCRYPTION_KEY já persistida em .setup.conf (carregada por
+# load_conf() em step_inputs); cai para um .env pré-existente como
+# compatibilidade com instalações anteriores a esta versão, que só
+# guardavam a chave no .env. Só gera uma chave nova se nenhuma das duas
+# fontes tiver uma: a chave NUNCA pode mudar depois que o volume n8n_data é
+# inicializado com ela — trocá-la depois causa 'Mismatching encryption keys'.
 existing_encryption_key() {
+    if [[ -n "$N8N_ENCRYPTION_KEY" ]]; then
+        printf '%s' "$N8N_ENCRYPTION_KEY"
+        return 0
+    fi
     [[ -r "$ENV_FILE" ]] || return 0
     grep -oP '^N8N_ENCRYPTION_KEY=\K.*' "$ENV_FILE" || true
 }
 
 step_generate_env() {
-    local encryption_key
-    encryption_key="$(existing_encryption_key)"
-    if [[ -z "$encryption_key" ]]; then
-        encryption_key="$(openssl rand -hex 32)"
+    N8N_ENCRYPTION_KEY="$(existing_encryption_key)"
+    if [[ -z "$N8N_ENCRYPTION_KEY" ]]; then
+        # Nenhuma chave conhecida (nem em .setup.conf, nem em .env) mas o
+        # volume de dados do n8n já existe: gerar uma chave nova agora vai
+        # deixá-la incompatível com a que está gravada dentro do volume.
+        if docker volume inspect "${COMPOSE_PROJECT_NAME}_n8n_data" >/dev/null 2>&1; then
+            log_warn "O volume '${COMPOSE_PROJECT_NAME}_n8n_data' já existe, mas nenhuma"
+            log_warn "N8N_ENCRYPTION_KEY foi encontrada em ${SETUP_CONF} nem em ${ENV_FILE}."
+            log_warn "Gerar uma chave nova agora vai causar 'Mismatching encryption keys' ao subir o n8n."
+            confirm "Gerar mesmo assim uma NOVA chave (dados existentes no volume podem ficar inacessíveis)?" || {
+                log_error "Informe a chave correta em N8N_ENCRYPTION_KEY dentro de ${SETUP_CONF} e re-execute."
+                exit 1
+            }
+        fi
+        N8N_ENCRYPTION_KEY="$(openssl rand -hex 32)"
         log_info "N8N_ENCRYPTION_KEY gerada (primeira execução)."
     else
-        log_info "N8N_ENCRYPTION_KEY reaproveitada do .env existente."
+        log_info "N8N_ENCRYPTION_KEY reaproveitada de execução anterior."
     fi
+
+    # Persiste a chave já aqui, antes do 'confirm' abaixo: mesmo que o
+    # usuário opte por não sobrescrever o .env, ou que uma etapa seguinte
+    # falhe, a chave gerada/reaproveitada fica salva em .setup.conf e nunca
+    # será gerada de novo nas próximas execuções.
+    save_conf
 
     if [[ -f "$ENV_FILE" ]]; then
         confirm "Já existe um .env em ${ENV_FILE}. Sobrescrever com os valores informados?" || {
@@ -330,7 +400,7 @@ DB_POSTGRESDB_SSL_ENABLED=true
 DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=true
 DB_POSTGRESDB_SSL_CA_FILE=
 
-N8N_ENCRYPTION_KEY=${encryption_key}
+N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
 
 EXECUTIONS_MODE=queue
 QUEUE_BULL_REDIS_HOST=${QUEUE_BULL_REDIS_HOST}
@@ -534,6 +604,7 @@ main() {
 
     SETUP_CONF="${COMPOSE_DIR}/.setup.conf"
     ENV_FILE="${COMPOSE_DIR}/.env"
+    check_state_files_writable
 
     log_info "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} — $(date -Is) ==="
     log_info "Repositório: ${REPO_DIR}"
