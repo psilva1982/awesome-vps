@@ -1,0 +1,22 @@
+# /etc/fail2ban/jail.local
+
+[DEFAULT]
+# Ban time: 1 hour
+bantime = 1h
+
+# Find time: 10 minutes (window to count retries)
+findtime = 10m
+
+# Max retries: 5 failures before ban
+maxretry = 5
+
+# Whitelist your IP addresses here (space separated)
+# ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24
+
+[sshd]
+enabled = true
+port    = ssh
+filter  = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 24h
