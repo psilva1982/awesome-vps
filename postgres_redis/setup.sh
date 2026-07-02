@@ -19,7 +19,7 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 
 readonly REPO_TARBALL_URL="https://github.com/psilva1982/awesome-vps/archive/refs/heads/main.tar.gz"
 readonly INSTALL_DIR="/opt/awesome-vps"
@@ -31,11 +31,13 @@ readonly PG_DATA="/var/lib/postgresql/${PG_VERSION}/main"
 readonly PG_CONF_DIR="/etc/postgresql/${PG_VERSION}/main"
 readonly REDIS_TLS_DIR="/etc/ssl/redis"
 readonly REDIS_KEYRING="/usr/share/keyrings/redis-archive-keyring.gpg"
+readonly REDIS_DATA_DIR="/var/lib/redis"
 # Fallback quando packages.redis.io ainda não publica o codename detectado
 readonly REDIS_FALLBACK_CODENAME="noble"
 readonly RENEW_HOOK="/etc/letsencrypt/renewal-hooks/deploy/vps-db-certs.sh"
 
 readonly STEP_SEQUENCE=(preflight inputs postgres pg_tuning redis firewall fail2ban certbot renew_hook pg_tls redis_tls summary)
+readonly PURGE_SEQUENCE=(confirm apps postgres redis certbot firewall fail2ban repo_apt state)
 
 REPO_DIR=""
 DOMAIN=""
@@ -45,6 +47,7 @@ CPUS=""
 RAM_GB=""
 UBUNTU_CODENAME_DETECTED=""
 CURRENT_STEP="(inicialização)"
+PURGE_FORCE=false
 
 usage() {
 cat <<EOF
@@ -64,10 +67,17 @@ OPÇÕES:
   -v, --version     Versão
   --only ETAPA      Executa apenas uma etapa (após preflight e inputs).
                     Etapas: ${STEP_SEQUENCE[*]}
+  --purge           DESTRUTIVO: desfaz toda a instalação e remove TODOS os
+                    dados (PostgreSQL, Redis, apps, certificados, firewall,
+                    Fail2Ban). Pede confirmação (domínio ou 'DESINSTALAR'),
+                    a menos que -f/--force seja usado.
+  -f, --force       Com --purge: pula a confirmação (útil para automação)
 
 Exemplos:
   sudo bash ${SCRIPT_NAME}
   sudo bash ${SCRIPT_NAME} --only certbot
+  sudo bash ${SCRIPT_NAME} --purge
+  sudo bash ${SCRIPT_NAME} --purge --force
 EOF
 }
 
@@ -698,6 +708,224 @@ step_summary() {
     echo "=============================================================="
 }
 
+# ==============================================================================
+# PURGE — desfaz toda a instalação, inclusive dados (--purge)
+# ==============================================================================
+
+# Mesma detecção de REPO_DIR do bootstrap_if_needed(), sem baixar o tarball:
+# purge não depende de REPO_DIR (a lógica é toda inline), mas tenta achá-lo
+# para manter CURRENT_STEP/logs consistentes se disponível.
+resolve_repo_dir_for_purge() {
+    local src="${BASH_SOURCE[0]:-}"
+    local script_dir=""
+
+    if [[ -n "$src" && "$src" != "bash" ]]; then
+        script_dir="$(cd "$(dirname "$src")" && pwd)"
+    fi
+
+    if [[ -n "$script_dir" && -f "${script_dir}/scripts/create_app_user.sh" ]]; then
+        REPO_DIR="$script_dir"
+    elif [[ -f "${INSTALL_DIR}/postgres_redis/scripts/create_app_user.sh" ]]; then
+        REPO_DIR="${INSTALL_DIR}/postgres_redis"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+purge_confirm() {
+    load_conf
+
+    if [[ "$PURGE_FORCE" == true ]]; then
+        log_warn "Modo --force: pulando confirmação de purge."
+        return 0
+    fi
+
+    log_warn "=============================================================="
+    log_warn " ATENÇÃO: isto vai REMOVER TUDO o que o setup.sh instalou:"
+    log_warn "  - PostgreSQL ${PG_VERSION} e TODOS os bancos/usuários de apps"
+    log_warn "  - Redis e TODAS as instâncias por app (dados perdidos)"
+    log_warn "  - Certificados Let's Encrypt (${DOMAIN:-desconhecido})"
+    log_warn "  - Fail2Ban e TODAS as regras do UFW, incluindo SSH/80/443"
+    log_warn "  - O UFW será DESATIVADO (ufw disable) — risco de perda de"
+    log_warn "    acesso remoto se outro mecanismo de acesso não estiver"
+    log_warn "    configurado (ex.: console web do provedor)."
+    log_warn "=============================================================="
+
+    local expected="${DOMAIN:-}"
+    local prompt
+    if [[ -n "$expected" ]]; then
+        prompt="Digite o domínio configurado (${expected}) ou 'DESINSTALAR' para confirmar: "
+    else
+        prompt="Domínio não encontrado em ${SETUP_CONF}. Digite 'DESINSTALAR' para confirmar: "
+    fi
+
+    local reply
+    reply="$(ask "$prompt")"
+
+    if [[ "$reply" == "DESINSTALAR" ]] || { [[ -n "$expected" ]] && [[ "$reply" == "$expected" ]]; }; then
+        return 0
+    fi
+
+    log_error "Confirmação não corresponde. Purge cancelado."
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Remove todas as instâncias Redis por-app (config, override systemd, dados,
+# log e pidfile), varrendo /etc/redis/redis-*.conf
+purge_all_redis_instances() {
+    shopt -s nullglob
+    local conf app
+    for conf in /etc/redis/redis-*.conf; do
+        app="$(basename "$conf" .conf)"
+        app="${app#redis-}"
+        log_info "Removendo instância Redis do app: ${app}"
+        systemctl disable --now "redis@${app}" 2>/dev/null || true
+        rm -rf "/etc/systemd/system/redis@${app}.service.d"
+        rm -f "$conf"
+        rm -rf "${REDIS_DATA_DIR}/${app}"
+        rm -f "/var/log/redis/redis-${app}.log"
+        rm -f "/var/run/redis/redis-${app}.pid"
+    done
+    shopt -u nullglob
+    systemctl daemon-reload
+}
+
+# ------------------------------------------------------------------------------
+# Remove todos os bancos/roles PostgreSQL de apps (tudo exceto 'postgres'),
+# e todas as instâncias Redis por-app — antes de mexer nos pacotes base.
+purge_apps() {
+    if command -v psql >/dev/null 2>&1 && systemctl is-active --quiet postgresql 2>/dev/null; then
+        psql_exec() { sudo -u postgres psql -v ON_ERROR_STOP=1 --quiet "$@"; }
+
+        local apps
+        apps="$(psql_exec -tAc "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres');")"
+
+        local app
+        while IFS= read -r app; do
+            app="$(printf '%s' "$app" | xargs || true)"
+            [[ -z "$app" ]] && continue
+            log_info "Removendo banco/usuário do app: ${app}"
+            psql_exec -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${app}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+            psql_exec -c "DROP DATABASE IF EXISTS \"${app}\";" || log_warn "Falha ao remover banco '${app}' (ignorando)."
+            psql_exec -c "DROP USER IF EXISTS \"${app}\";" || log_warn "Falha ao remover usuário '${app}' (pode ter objetos em outros bancos)."
+        done <<< "$apps"
+    else
+        log_info "PostgreSQL não está ativo; pulando remoção de bancos/usuários de apps."
+    fi
+
+    purge_all_redis_instances
+}
+
+# ------------------------------------------------------------------------------
+purge_postgres() {
+    systemctl disable --now postgresql 2>/dev/null || true
+
+    if dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1; then
+        apt-get purge -y "postgresql-${PG_VERSION}" postgresql-common postgresql-client-common 2>/dev/null || true
+    else
+        log_info "postgresql-${PG_VERSION} não instalado; pulando purge do pacote."
+    fi
+
+    rm -rf "$PG_DATA" /etc/postgresql /var/lib/postgresql
+    log_info "PostgreSQL removido."
+}
+
+# ------------------------------------------------------------------------------
+purge_redis() {
+    systemctl disable --now redis-server 2>/dev/null || true
+
+    if [[ -f /etc/systemd/system/redis@.service ]]; then
+        rm -f /etc/systemd/system/redis@.service
+        systemctl daemon-reload
+    fi
+
+    if dpkg -s redis >/dev/null 2>&1; then
+        apt-get purge -y redis 2>/dev/null || true
+    else
+        log_info "Pacote redis não instalado; pulando purge do pacote."
+    fi
+
+    rm -rf /etc/redis /var/lib/redis /var/log/redis /var/run/redis "$REDIS_TLS_DIR"
+    log_info "Redis removido."
+}
+
+# ------------------------------------------------------------------------------
+purge_certbot() {
+    if [[ -n "$DOMAIN" ]] && command -v certbot >/dev/null 2>&1; then
+        certbot delete --cert-name "$DOMAIN" --non-interactive 2>/dev/null || true
+    fi
+
+    if dpkg -s certbot >/dev/null 2>&1; then
+        apt-get purge -y certbot 2>/dev/null || true
+    else
+        log_info "certbot não instalado; pulando purge do pacote."
+    fi
+
+    rm -rf /etc/letsencrypt
+    log_info "Certbot e certificados removidos."
+}
+
+# ------------------------------------------------------------------------------
+purge_firewall() {
+    log_warn "Revertendo TODAS as regras do UFW, incluindo SSH — acesso remoto pode ser perdido."
+    ufw --force reset 2>/dev/null || true
+    ufw disable 2>/dev/null || true
+    log_info "UFW resetado e desativado."
+}
+
+# ------------------------------------------------------------------------------
+purge_fail2ban() {
+    systemctl disable --now fail2ban 2>/dev/null || true
+
+    if dpkg -s fail2ban >/dev/null 2>&1; then
+        apt-get purge -y fail2ban 2>/dev/null || true
+    else
+        log_info "fail2ban não instalado; pulando purge do pacote."
+    fi
+
+    rm -f /etc/fail2ban/jail.local /etc/fail2ban/jail.d/sshd-systemd.local
+    log_info "Fail2Ban removido."
+}
+
+# ------------------------------------------------------------------------------
+purge_repo_apt() {
+    rm -f "$REDIS_KEYRING" /etc/apt/sources.list.d/redis.list
+    rm -f /etc/apt/sources.list.d/pgdg.list /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg
+
+    apt-get autoremove -y 2>/dev/null || true
+    apt-get update -qq 2>/dev/null || true
+    log_info "Repositórios e keyrings apt removidos."
+}
+
+# ------------------------------------------------------------------------------
+purge_state() {
+    rm -f "$SETUP_CONF"
+    log_info "Estado do projeto removido (${SETUP_CONF})."
+    log_info "Log de execução preservado em ${LOG_FILE} (não removido)."
+    if [[ -d "$INSTALL_DIR" ]]; then
+        log_warn "Cópia do repositório em ${INSTALL_DIR} não foi removida (pode estar em uso). Remova manualmente se desejar."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+run_purge_step() {
+    local step="$1"
+    CURRENT_STEP="purge:${step}"
+    log_info "==> Purge: ${step}"
+    "purge_${step}"
+}
+
+do_purge() {
+    resolve_repo_dir_for_purge
+
+    local step
+    for step in "${PURGE_SEQUENCE[@]}"; do
+        run_purge_step "$step"
+    done
+
+    log_info "Purge concluído."
+}
+
 # ------------------------------------------------------------------------------
 run_step() {
     local step="$1"
@@ -708,6 +936,7 @@ run_step() {
 
 main() {
     local only=""
+    local purge=false
     local -a orig_args=("$@")
 
     while [[ $# -gt 0 ]]; do
@@ -720,6 +949,8 @@ main() {
                     exit 2
                 }
                 only="$2"; shift 2 ;;
+            --purge) purge=true; shift ;;
+            -f|--force) PURGE_FORCE=true; shift ;;
             *) log_error "Opção desconhecida: $1"; usage; exit 2 ;;
         esac
     done
@@ -727,6 +958,18 @@ main() {
     if [[ "$EUID" -ne 0 ]]; then
         log_error "Execute como root (sudo)"
         exit 1
+    fi
+
+    if [[ "$purge" == true && -n "$only" ]]; then
+        log_error "--purge não pode ser combinado com --only"
+        exit 2
+    fi
+
+    if [[ "$purge" == true ]]; then
+        exec > >(tee -a "$LOG_FILE") 2>&1
+        log_info "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} — purge — $(date -Is) ==="
+        do_purge
+        return 0
     fi
 
     if [[ -n "$only" ]]; then

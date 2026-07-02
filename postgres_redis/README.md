@@ -37,6 +37,32 @@ sudo bash setup.sh
 4. **Configuration & Tuning**: Applies the optimized `custom.conf` for PostgreSQL and sets up systemd templates for Redis.
 5. **TLS Provisioning**: Obtains certificates via Certbot standalone mode and injects them into the respective database services.
 
+### Uninstalling the Stack (`--purge`)
+
+`setup.sh` also supports a fully destructive teardown that reverses everything above, **including all data**:
+
+```bash
+# Interactive: asks you to type the configured domain (or "DESINSTALAR") to confirm
+sudo bash setup.sh --purge
+
+# Non-interactive (automation): skips the confirmation prompt
+sudo bash setup.sh --purge --force
+```
+
+`--purge` cannot be combined with `--only`. It walks its own reverse sequence (`confirm → apps → postgres → redis → certbot → firewall → fail2ban → repo_apt → state`) and is idempotent — running it twice in a row, or against a partially-provisioned host, does not error out.
+
+What it removes:
+- **Every application's data first**: all per-app PostgreSQL databases/roles and all per-app Redis instances (`redis@<app>`, their config, systemd overrides, and `/var/lib/redis/<app>` data), before touching the base stack.
+- **PostgreSQL, Redis, Certbot, and Fail2Ban**, via `apt purge` plus explicit cleanup of any directories the package removal doesn't catch (`/var/lib/postgresql`, `/etc/postgresql`, `/var/lib/redis`, `/etc/redis`, `/etc/ssl/redis`).
+- **The Let's Encrypt certificate and all of `/etc/letsencrypt`** (including the renewal deploy-hook).
+- **All UFW rules, including SSH/80/443** (`ufw --force reset`), followed by `ufw disable`. This is intentional: `--purge` is meant to leave nothing behind. **Make sure you have out-of-band access to the VPS (e.g. your provider's web console) before running it**, since disabling UFW removes all packet filtering, and any assumption that firewall rules were your only access control is no longer true afterward.
+- The apt repositories/keyrings added for Redis and PGDG, followed by `apt autoremove`.
+- The stack's own state file, `/etc/vps-setup.conf`.
+
+What it deliberately keeps: `/var/log/vps-setup.log` (audit trail of the purge itself) and the self-extracted repo copy at `/opt/awesome-vps` (only a warning is logged — the running script may itself be executing from there).
+
+> ⚠️ There is no dry-run mode. Test `--purge` on a disposable VM before ever running it against a production VPS.
+
 ---
 
 ## Operational Scripts
@@ -110,6 +136,10 @@ At a high level, the system establishes a secure network perimeter and provision
 ### 3. Automated Certificate Distribution
 **Decision:** Implement a custom deploy-hook `/etc/letsencrypt/renewal-hooks/deploy/vps-db-certs.sh`.
 **Rationale:** Let's Encrypt certificates renew every 60-90 days. Manually copying these to the databases is prone to error. The deploy-hook ensures that every time Certbot renews a certificate, it is automatically copied to the correct PostgreSQL and Redis directories with the correct file permissions (`0600` / `0640`), followed by a seamless service reload.
+
+### 4. Full, Reversible Teardown (`--purge`)
+**Decision:** Give `setup.sh` its own destructive counterpart to provisioning, rather than expecting operators to manually reverse-engineer every file/package/service it touches.
+**Rationale:** An idempotent installer that can never be cleanly undone forces operators to either keep stale test VPSes around indefinitely or manually hunt down every artifact (packages, systemd units, `/etc/redis/*`, UFW rules, Let's Encrypt state) before reprovisioning. `--purge` inverts the same mental model as the install flow — an explicit, ordered sequence of steps — instead of ad-hoc cleanup, and tears down per-application data first (while services are still controllable) before removing the base stack and packages. The confirmation gate (typing the domain or `DESINSTALAR`) and full UFW reset are deliberately aggressive: this is a one-way operation, not a partial rollback.
 
 ---
 
@@ -185,4 +215,5 @@ openssl s_client -connect db.example.com:<port> -brief
 
 - **Certbot Renewal Failures:** Ensure that port 80 is not blocked or used by another process. The standalone authenticator requires it.
 - **Redis Connection Refused:** Verify that the per-app instance is running (`systemctl status redis@<app>`) and that you are connecting with the `--tls` flag.
-- **Logs:** Review the main setup log at `/var/log/vps-setup.log`. PostgreSQL logs are rotated daily in `/var/lib/postgresql/17/main/log/`.
+- **Logs:** Review the main setup log at `/var/log/vps-setup.log`. PostgreSQL logs are rotated daily in `/var/lib/postgresql/17/main/log/`. This log is preserved across `--purge` runs, so it also holds the record of any teardown performed.
+- **Starting over from scratch:** if the host ends up in a broken/partial state (e.g. a failed step midway through provisioning) and resuming with a plain re-run of `setup.sh` doesn't recover it, `sudo bash setup.sh --purge --force` followed by `sudo bash setup.sh` gives you a clean slate — see [Uninstalling the Stack](#uninstalling-the-stack---purge) above.

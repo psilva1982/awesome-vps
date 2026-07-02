@@ -13,6 +13,7 @@ readonly REDIS_BASE_PORT=6380
 readonly REDIS_CONFIG_DIR="/etc/redis"
 readonly REDIS_SERVICE_DIR="/etc/systemd/system"
 readonly REDIS_TLS_DIR="/etc/ssl/redis"
+readonly REDIS_DATA_DIR="/var/lib/redis"
 readonly VPS_SETUP_CONF="/etc/vps-setup.conf"
 
 usage() {
@@ -130,6 +131,13 @@ create_redis_config() {
     local config_file="${REDIS_CONFIG_DIR}/redis-${app_name}.conf"
     local maxmemory="${4:-256mb}"
 
+    # dir precisa existir e pertencer ao usuário redis: sem ela, o CWD do
+    # processo (WorkingDirectory do systemd não é setado) cai em "/", onde o
+    # usuário redis não tem permissão de escrita para o AOF, e o serviço
+    # falha ao subir silenciosamente (systemctl start só reporta erro genérico)
+    local data_dir="${REDIS_DATA_DIR}/${app_name}"
+    install -d -o redis -g redis -m 0750 "$data_dir"
+
     # I/O threads (Redis 8): só compensa com >= 4 vCPUs, deixando cores livres
     # para o event loop e o restante do servidor (recomendação do redis.conf:
     # ~cores-2; mais de 8 threads dificilmente ajuda)
@@ -172,6 +180,7 @@ supervised systemd
 pidfile /var/run/redis/redis-${app_name}.pid
 loglevel notice
 logfile /var/log/redis/redis-${app_name}.log
+dir ${data_dir}
 
 # Security
 requirepass ${password}
@@ -222,18 +231,25 @@ enable_and_start() {
     local app_name="$1"
 
     systemctl daemon-reload
-    systemctl enable "redis@${app_name}" 2>/dev/null || \
-        systemctl enable redis-server 2>/dev/null
 
-    if systemctl start "redis@${app_name}" 2>/dev/null; then
-        log_info "Serviço iniciado: redis@${app_name}"
-    elif systemctl start redis-server 2>/dev/null; then
-        log_info "Serviço redis-server iniciado"
-    else
-        log_error "Falha ao iniciar Redis"
+    if [[ ! -f "${REDIS_SERVICE_DIR}/redis@.service" ]]; then
+        log_error "Template ${REDIS_SERVICE_DIR}/redis@.service não encontrado (rode setup.sh antes)"
         return 1
     fi
 
+    systemctl enable "redis@${app_name}" 2>/dev/null || true
+
+    # Sem fallback para redis-server: essa instância genérica fica desabilitada
+    # de propósito (setup.sh) e não usa a config/porta/senha desta instância —
+    # subi-la aqui mascararia o erro real por trás de "conexão OK" na porta errada.
+    if ! systemctl start "redis@${app_name}"; then
+        log_error "Falha ao iniciar redis@${app_name}. Diagnóstico:"
+        systemctl status "redis@${app_name}" --no-pager 2>&1 | tail -n 20 >&2 || true
+        journalctl -u "redis@${app_name}" --no-pager -n 20 2>&1 >&2 || true
+        return 1
+    fi
+
+    log_info "Serviço iniciado: redis@${app_name}"
     sleep 1
     return 0
 }
