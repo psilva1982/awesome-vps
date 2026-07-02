@@ -1,0 +1,1 @@
+`setup.sh` relies on bash-specific features (arrays, `[[ ]]`, process substitution) and is intentionally bash, not POSIX `sh` — do not attempt a POSIX rewrite; other scripts in this repo depend on bash arrays and syntax too.

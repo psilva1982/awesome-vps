@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# setup_bd.sh - Bootstrap de VPS de banco de dados
-#               PostgreSQL 17 + Redis 8 + Certbot/TLS + UFW + Fail2Ban
+# setup.sh - Bootstrap de VPS de banco de dados
+#            PostgreSQL 17 + Redis 8 + Certbot/TLS + UFW + Fail2Ban
 #
 # Uso típico em um VPS Ubuntu 26.04 LTS recém-criado:
-#   curl -fsSL https://raw.githubusercontent.com/psilva1982/commands/main/setup/setup_bd.sh -o setup_bd.sh
-#   sudo bash setup_bd.sh
+#   curl -fsSL https://raw.githubusercontent.com/psilva1982/awesome-vps/main/postgres_redis/setup.sh -o setup.sh
+#   sudo bash setup.sh
 #
-# O script baixa o repositório completo para /opt/commands e se re-executa
-# de lá. É idempotente: re-executar retoma de onde parou.
+# O script baixa o repositório completo para /opt/awesome-vps e se
+# re-executa de lá. É idempotente: re-executar retoma de onde parou.
 #
 # POSIX Note: This script currently relies on bash-specific features (arrays, 
 # [[ ]], process substitution). For strict POSIX compliance (posix-shell-pro), 
@@ -19,10 +19,10 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 
-readonly REPO_TARBALL_URL="https://github.com/psilva1982/commands/archive/refs/heads/main.tar.gz"
-readonly INSTALL_DIR="/opt/commands"
+readonly REPO_TARBALL_URL="https://github.com/psilva1982/awesome-vps/archive/refs/heads/main.tar.gz"
+readonly INSTALL_DIR="/opt/awesome-vps"
 readonly SETUP_CONF="/etc/vps-setup.conf"
 readonly LOG_FILE="/var/log/vps-setup.log"
 
@@ -41,6 +41,8 @@ REPO_DIR=""
 DOMAIN=""
 EMAIL=""
 TRUSTED_IPS=""
+CPUS=""
+RAM_GB=""
 UBUNTU_CODENAME_DETECTED=""
 CURRENT_STEP="(inicialização)"
 
@@ -52,9 +54,10 @@ Provisiona um VPS Ubuntu 26.04 LTS como servidor de banco de dados:
 PostgreSQL ${PG_VERSION} (PGDG), Redis 8 (packages.redis.io), certificado
 Let's Encrypt com TLS no PostgreSQL e no Redis, UFW e Fail2Ban.
 
-Pergunta interativamente: domínio (certificado), e-mail (Let's Encrypt) e
-IPs confiáveis (firewall). As respostas ficam em ${SETUP_CONF} e são
-reaproveitadas em re-execuções.
+Pergunta interativamente: domínio (certificado), e-mail (Let's Encrypt),
+IPs confiáveis (firewall) e capacidade do servidor — vCPUs e RAM — usada
+no tuning do PostgreSQL e do Redis. As respostas ficam em ${SETUP_CONF}
+e são reaproveitadas em re-execuções.
 
 OPÇÕES:
   -h, --help        Ajuda
@@ -117,6 +120,18 @@ validate_ip() {
     return 1
 }
 
+validate_positive_int() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]]
+}
+
+# clamp VALOR MIN MAX — limita um inteiro ao intervalo [MIN, MAX]
+clamp() {
+    local v="$1" min="$2" max="$3"
+    if (( v < min )); then v="$min"; fi
+    if (( v > max )); then v="$max"; fi
+    printf '%s' "$v"
+}
+
 # ------------------------------------------------------------------------------
 # Bootstrap: se não estamos dentro do repositório, baixa-o e re-executa de lá
 bootstrap_if_needed() {
@@ -141,10 +156,10 @@ bootstrap_if_needed() {
 
     mkdir -p "$INSTALL_DIR"
     curl -fsSL "$REPO_TARBALL_URL" | tar -xz --strip-components=1 -C "$INSTALL_DIR"
-    chmod +x "${INSTALL_DIR}/setup/"*.sh "${INSTALL_DIR}"/scripts/*.sh
+    chmod +x "${INSTALL_DIR}/postgres_redis/"*.sh "${INSTALL_DIR}/postgres_redis/scripts/"*.sh
 
     log_info "Repositório extraído. Re-executando de ${INSTALL_DIR}..."
-    exec bash "${INSTALL_DIR}/setup/setup_bd.sh" "$@"
+    exec bash "${INSTALL_DIR}/postgres_redis/setup.sh" "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -187,10 +202,12 @@ load_conf() {
 save_conf() {
     umask 077
     cat > "$SETUP_CONF" <<EOF
-# Gerado por setup_bd.sh — respostas do provisionamento (reutilizadas em re-execuções)
+# Gerado por setup.sh — respostas do provisionamento (reutilizadas em re-execuções)
 DOMAIN="${DOMAIN}"
 EMAIL="${EMAIL}"
 TRUSTED_IPS="${TRUSTED_IPS}"
+CPUS="${CPUS}"
+RAM_GB="${RAM_GB}"
 EOF
     log_info "Respostas salvas em ${SETUP_CONF}"
 }
@@ -225,6 +242,39 @@ step_inputs() {
         done
         [[ $ok -eq 1 ]] || TRUSTED_IPS=""
     done
+
+    # Capacidade do servidor: usada no tuning do PostgreSQL e do Redis.
+    # Detecta valores como sugestão; Enter aceita o detectado.
+    local detected_cpus detected_ram_gb
+    detected_cpus="$(nproc 2>/dev/null || echo 1)"
+    detected_ram_gb="$(awk '/^MemTotal:/ {printf "%d", ($2 + 524288) / 1048576}' /proc/meminfo 2>/dev/null || echo 1)"
+    if [[ -z "$detected_ram_gb" || "$detected_ram_gb" -lt 1 ]]; then
+        detected_ram_gb=1
+    fi
+
+    while ! validate_positive_int "$CPUS"; do
+        CPUS="$(ask "vCPUs do servidor [${detected_cpus}]: ")"
+        if [[ -z "$CPUS" ]]; then
+            CPUS="$detected_cpus"
+        fi
+        validate_positive_int "$CPUS" || {
+            log_warn "Valor inválido: '${CPUS}' (inteiro >= 1)"
+            CPUS=""
+        }
+    done
+
+    while ! validate_positive_int "$RAM_GB"; do
+        RAM_GB="$(ask "RAM do servidor em GB [${detected_ram_gb}]: ")"
+        if [[ -z "$RAM_GB" ]]; then
+            RAM_GB="$detected_ram_gb"
+        fi
+        validate_positive_int "$RAM_GB" || {
+            log_warn "Valor inválido: '${RAM_GB}' (inteiro >= 1)"
+            RAM_GB=""
+        }
+    done
+
+    log_info "Capacidade informada: ${CPUS} vCPU / ${RAM_GB} GB RAM"
 
     # DNS: o domínio precisa apontar para este VPS antes do Certbot (standalone)
     local resolved public_ip
@@ -272,20 +322,66 @@ step_postgres() {
 }
 
 # ------------------------------------------------------------------------------
+# Calcula o tuning do PostgreSQL a partir da capacidade informada (CPUS/RAM_GB).
+# Fórmulas estilo PGTune (perfil misto/OLTP) para storage NVMe.
+compute_pg_tuning() {
+    local ram_mb=$((RAM_GB * 1024))
+
+    PG_SHARED_BUFFERS_MB=$((ram_mb / 4))
+    PG_EFFECTIVE_CACHE_MB=$((ram_mb * 3 / 4))
+    PG_MAINTENANCE_MB="$(clamp $((ram_mb / 16)) 64 2048)"
+    PG_MAX_CONNECTIONS=200
+
+    # pior caso: max_connections × 2 workers × work_mem ≈ 80% da RAM
+    PG_WORK_MEM_MB="$(clamp $((ram_mb * 8 / 10 / (PG_MAX_CONNECTIONS * 2))) 4 1048576)"
+
+    PG_WAL_BUFFERS_MB="$(clamp $((PG_SHARED_BUFFERS_MB / 32)) 16 64)"
+    if (( RAM_GB >= 16 )); then
+        PG_MIN_WAL="2GB"
+        PG_MAX_WAL="8GB"
+    else
+        PG_MIN_WAL="1GB"
+        PG_MAX_WAL="4GB"
+    fi
+
+    PG_MAX_WORKER_PROCESSES="$CPUS"
+    PG_MAX_PARALLEL_WORKERS="$CPUS"
+    if (( CPUS == 1 )); then
+        # 1 vCPU: paralelismo em queries só atrapalha
+        PG_PARALLEL_PER_GATHER=0
+    else
+        PG_PARALLEL_PER_GATHER="$(clamp $((CPUS / 2)) 1 4)"
+    fi
+    PG_PARALLEL_MAINTENANCE="$(clamp $((CPUS / 2)) 1 4)"
+
+    PG_AUTOVACUUM_WORKERS=3
+    if (( CPUS >= 8 )); then
+        PG_AUTOVACUUM_WORKERS=4
+    fi
+}
+
+# ------------------------------------------------------------------------------
 step_pg_tuning() {
     local custom_conf="${PG_CONF_DIR}/conf.d/custom.conf"
-    
+
+    compute_pg_tuning
+
     install -d -o postgres -g postgres "${PG_CONF_DIR}/conf.d"
-    
-    cat > "$custom_conf" <<'EOF'
+
+    cat > "$custom_conf" <<EOF
 # =============================================================
-# MEMORY — 4 vCPU / 8 GB RAM
+# Gerado por setup.sh para ${CPUS} vCPU / ${RAM_GB} GB RAM / NVMe
+# (fórmulas estilo PGTune, perfil misto/OLTP)
 # =============================================================
-shared_buffers = 2GB           # 25% da RAM — cache principal do PG
-effective_cache_size = 6GB     # 75% da RAM — estimativa para o planner
-work_mem = 16MB                # pior caso: 200 conn × 2 workers × 16 MB = 6,4 GB
-maintenance_work_mem = 256MB   # VACUUM, CREATE INDEX, ALTER TABLE
-max_connections = 200          # use pgBouncer para workloads com muitas conexões curtas
+
+# =============================================================
+# MEMORY
+# =============================================================
+shared_buffers = ${PG_SHARED_BUFFERS_MB}MB      # 25% da RAM — cache principal do PG
+effective_cache_size = ${PG_EFFECTIVE_CACHE_MB}MB    # 75% da RAM — estimativa para o planner
+work_mem = ${PG_WORK_MEM_MB}MB          # pior caso: ${PG_MAX_CONNECTIONS} conn × 2 workers × ${PG_WORK_MEM_MB}MB ≈ 80% da RAM
+maintenance_work_mem = ${PG_MAINTENANCE_MB}MB  # VACUUM, CREATE INDEX, ALTER TABLE (RAM/16, máx 2GB)
+max_connections = ${PG_MAX_CONNECTIONS}          # use pgBouncer para workloads com muitas conexões curtas
 
 # =============================================================
 # STORAGE — NVMe SSD
@@ -297,19 +393,19 @@ default_statistics_target = 500
 # =============================================================
 # WAL
 # =============================================================
-wal_buffers = 64MB
-min_wal_size = 1GB
-max_wal_size = 4GB
+wal_buffers = ${PG_WAL_BUFFERS_MB}MB       # shared_buffers/32, entre 16MB e 64MB
+min_wal_size = ${PG_MIN_WAL}
+max_wal_size = ${PG_MAX_WAL}
 checkpoint_completion_target = 0.9
 wal_compression = on
 
 # =============================================================
-# PARALELISMO — 4 vCPUs
+# PARALELISMO — ${CPUS} vCPUs
 # =============================================================
-max_worker_processes = 4              # total de workers em background (= vCPUs)
-max_parallel_workers = 4             # workers disponíveis para queries paralelas
-max_parallel_workers_per_gather = 2  # workers por query (vCPUs ÷ 2 para OLTP misto)
-max_parallel_maintenance_workers = 2  # workers para VACUUM/CREATE INDEX
+max_worker_processes = ${PG_MAX_WORKER_PROCESSES}             # total de workers em background (= vCPUs)
+max_parallel_workers = ${PG_MAX_PARALLEL_WORKERS}             # workers disponíveis para queries paralelas
+max_parallel_workers_per_gather = ${PG_PARALLEL_PER_GATHER}   # workers por query (vCPUs ÷ 2 para OLTP misto, máx 4)
+max_parallel_maintenance_workers = ${PG_PARALLEL_MAINTENANCE} # workers para VACUUM/CREATE INDEX
 
 # =============================================================
 # LOGGING
@@ -338,7 +434,7 @@ track_functions = pl
 # =============================================================
 # AUTOVACUUM
 # =============================================================
-autovacuum_max_workers = 3           # 3 workers = padrão PG; 4 compete com queries em 4 vCPUs
+autovacuum_max_workers = ${PG_AUTOVACUUM_WORKERS}            # 3 = padrão PG; 4 a partir de 8 vCPUs
 autovacuum_naptime = 30s
 autovacuum_vacuum_threshold = 50
 autovacuum_analyze_threshold = 50
@@ -346,7 +442,7 @@ autovacuum_vacuum_cost_delay = 2ms   # NVMe: reduzir throttle do autovacuum (pad
 EOF
     chown postgres:postgres "$custom_conf"
     systemctl restart postgresql
-    log_info "PostgreSQL tuning configurado em ${custom_conf} (4 vCPU / 8 GB RAM / NVMe)."
+    log_info "PostgreSQL tuning configurado em ${custom_conf} (${CPUS} vCPU / ${RAM_GB} GB RAM / NVMe)."
 }
 
 # ------------------------------------------------------------------------------
@@ -439,7 +535,7 @@ step_firewall() {
 step_fail2ban() {
     dpkg -s fail2ban >/dev/null 2>&1 || apt-get install -y fail2ban
 
-    local src="${REPO_DIR}/configs/fail2ban/fail2ban-ssh.local"
+    local src="${REPO_DIR}/fail2ban/fail2ban-ssh.local"
     local dst="/etc/fail2ban/jail.local"
     if ! cmp -s "$src" "$dst" 2>/dev/null; then
         cp "$src" "$dst"
@@ -484,7 +580,7 @@ step_renew_hook() {
 
     cat > "$RENEW_HOOK" <<EOF
 #!/usr/bin/env bash
-# Gerado por setup_bd.sh: distribui o certificado Let's Encrypt para o
+# Gerado por setup.sh: distribui o certificado Let's Encrypt para o
 # PostgreSQL e para as instâncias Redis a cada emissão/renovação.
 set -Eeuo pipefail
 
@@ -530,7 +626,7 @@ step_pg_tls() {
 
     local desired
     desired="$(cat <<EOF
-# Gerado por setup_bd.sh — TLS e acesso remoto
+# Gerado por setup.sh — TLS e acesso remoto
 listen_addresses = '*'
 ssl = on
 ssl_cert_file = '${PG_DATA}/server.crt'
@@ -549,7 +645,7 @@ EOF
     if ! grep -q '^hostssl' "$pg_hba"; then
         cat >> "$pg_hba" <<EOF
 
-# Conexões remotas somente com TLS (setup_bd.sh); firewall restringe as origens
+# Conexões remotas somente com TLS (setup.sh); firewall restringe as origens
 hostssl all             all             0.0.0.0/0               scram-sha-256
 hostssl all             all             ::/0                    scram-sha-256
 EOF
@@ -582,6 +678,7 @@ step_summary() {
     echo " Provisionamento concluído"
     echo "=============================================================="
     echo " Domínio:      ${DOMAIN}"
+    echo " Capacidade:   ${CPUS} vCPU / ${RAM_GB} GB RAM"
     echo " PostgreSQL:   $(psql --version 2>/dev/null || echo 'não encontrado')"
     echo " Redis:        $(redis-server --version 2>/dev/null || echo 'não encontrado')"
     echo " Certificado:  /etc/letsencrypt/live/${DOMAIN}/"

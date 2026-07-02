@@ -7,7 +7,7 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 
 readonly REDIS_BASE_PORT=6380
 readonly REDIS_CONFIG_DIR="/etc/redis"
@@ -27,10 +27,14 @@ OPÇÕES:
   -l, --length N   Tamanho da senha (>=16, padrão: 32)
   -o, --output FILE Salvar credenciais
   -p, --port PORTA Porta TCP (padrão: automático)
+  -m, --maxmemory M Limite de memória da instância, ex.: 512mb, 1gb
+                    (padrão: RAM/16 a partir de ${VPS_SETUP_CONF},
+                    entre 128mb e 2048mb; sem o arquivo: 256mb)
 
 Exemplo:
   ${SCRIPT_NAME} meuapp
   ${SCRIPT_NAME} --port 6380 meuapp
+  ${SCRIPT_NAME} --maxmemory 1gb meuapp
 
 TLS: se existirem certificados em ${REDIS_TLS_DIR} (server.crt/server.key,
 provisionados pelo setup.sh via Let's Encrypt), a instância é criada com TLS
@@ -57,6 +61,34 @@ generate_password() {
 # ------------------------------------------------------------------------------
 tls_available() {
     [[ -f "${REDIS_TLS_DIR}/server.crt" && -f "${REDIS_TLS_DIR}/server.key" ]]
+}
+
+# ------------------------------------------------------------------------------
+# Lê a capacidade do servidor salva pelo setup.sh (CPUS/RAM_GB) para derivar
+# os defaults de tuning da instância. Sem o arquivo: defaults conservadores.
+load_server_capacity() {
+    SERVER_CPUS=""
+    SERVER_RAM_GB=""
+    if [[ -r "$VPS_SETUP_CONF" ]]; then
+        SERVER_CPUS=$(grep -oP '^CPUS="\K[^"]+' "$VPS_SETUP_CONF" || true)
+        SERVER_RAM_GB=$(grep -oP '^RAM_GB="\K[^"]+' "$VPS_SETUP_CONF" || true)
+    fi
+    [[ "$SERVER_CPUS" =~ ^[0-9]+$ ]] || SERVER_CPUS=""
+    [[ "$SERVER_RAM_GB" =~ ^[0-9]+$ ]] || SERVER_RAM_GB=""
+}
+
+# RAM/16 por instância (várias apps dividem o budget; o PostgreSQL fica com o
+# grosso da RAM), entre 128mb e 2048mb. Capacidade desconhecida: 256mb.
+default_maxmemory() {
+    if [[ -z "$SERVER_RAM_GB" ]]; then
+        printf '256mb'
+        return 0
+    fi
+
+    local mb=$((SERVER_RAM_GB * 1024 / 16))
+    if (( mb < 128 )); then mb=128; fi
+    if (( mb > 2048 )); then mb=2048; fi
+    printf '%smb' "$mb"
 }
 
 # ------------------------------------------------------------------------------
@@ -98,6 +130,19 @@ create_redis_config() {
     local config_file="${REDIS_CONFIG_DIR}/redis-${app_name}.conf"
     local maxmemory="${4:-256mb}"
 
+    # I/O threads (Redis 8): só compensa com >= 4 vCPUs, deixando cores livres
+    # para o event loop e o restante do servidor (recomendação do redis.conf:
+    # ~cores-2; mais de 8 threads dificilmente ajuda)
+    local io_threads_block=""
+    if [[ -n "$SERVER_CPUS" ]] && (( SERVER_CPUS >= 4 )); then
+        local io_threads=$((SERVER_CPUS - 2))
+        if (( io_threads > 8 )); then io_threads=8; fi
+        io_threads_block="
+
+# Performance (${SERVER_CPUS} vCPUs)
+io-threads ${io_threads}"
+    fi
+
     local network_block
     if tls_available; then
         # TLS: porta cifrada exposta (o firewall restringe as origens);
@@ -138,7 +183,7 @@ rename-command DEBUG ""
 # Memory
 maxmemory ${maxmemory}
 maxmemory-policy allkeys-lru
-maxmemory-samples 5
+maxmemory-samples 5${io_threads_block}
 
 # Persistence
 save ""
@@ -219,6 +264,7 @@ main() {
     local password_length=32
     local output_file=""
     local port=""
+    local maxmemory=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -242,6 +288,12 @@ main() {
                     exit 2
                 }
                 port="$2"; shift 2 ;;
+            -m|--maxmemory)
+                [[ -z "${2:-}" || ! "$2" =~ ^[0-9]+([mMgG][bB])?$ ]] && {
+                    log_error "Maxmemory inválido (ex.: 512mb, 1gb)"
+                    exit 2
+                }
+                maxmemory="$2"; shift 2 ;;
             -*) log_error "Opção desconhecida: $1"; exit 2 ;;
             *) break ;;
         esac
@@ -283,9 +335,14 @@ main() {
         exit 1
     fi
 
-    log_info "Criando instância Redis para: ${app_name}"
+    load_server_capacity
+    if [[ -z "$maxmemory" ]]; then
+        maxmemory=$(default_maxmemory)
+    fi
 
-    create_redis_config "$app_name" "$port" "$password"
+    log_info "Criando instância Redis para: ${app_name} (maxmemory: ${maxmemory})"
+
+    create_redis_config "$app_name" "$port" "$password" "$maxmemory"
     create_systemd_override "$app_name"
     enable_and_start "$app_name" || exit 1
     test_connection "$port" "$password" || exit 1
