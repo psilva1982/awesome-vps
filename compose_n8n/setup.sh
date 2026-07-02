@@ -1,0 +1,396 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# setup.sh - Bootstrap do stack n8n (docker-compose.yml)
+#            Gera o .env a partir de Postgres/Redis externos (stack
+#            postgres_redis) e sobe o compose atrás de um Traefik externo.
+#
+# Uso típico em um VPS de aplicação, com o Traefik externo já em produção
+# (rede docker "traefik_public") e o Postgres/Redis já provisionados em
+# outro VPS via postgres_redis/setup.sh + create_app_user.sh/create_app_redis.sh:
+#
+#   curl -fsSL https://raw.githubusercontent.com/psilva1982/awesome-vps/main/compose_n8n/setup.sh -o setup.sh
+#   bash setup.sh
+#
+# O script baixa o repositório completo para /opt/awesome-vps e se
+# re-executa de lá. É idempotente: re-executar reaproveita as respostas
+# salvas e não sobrescreve o .env sem confirmação.
+#
+# POSIX Note: This script currently relies on bash-specific features (arrays,
+# [[ ]], process substitution). For strict POSIX compliance (posix-shell-pro),
+# consider migrating these constructs.
+# ==============================================================================
+
+set -Eeuo pipefail
+shopt -s inherit_errexit
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly SCRIPT_VERSION="1.0.0"
+
+readonly REPO_TARBALL_URL="https://github.com/psilva1982/awesome-vps/archive/refs/heads/main.tar.gz"
+readonly INSTALL_DIR="/opt/awesome-vps"
+
+REPO_DIR=""
+COMPOSE_DIR=""
+SETUP_CONF=""
+ENV_FILE=""
+CURRENT_STEP="(inicialização)"
+
+readonly STEP_SEQUENCE=(preflight inputs generate_env up summary)
+
+DOMAIN=""
+DB_POSTGRESDB_HOST=""
+DB_POSTGRESDB_PORT=""
+POSTGRES_DB=""
+POSTGRES_USER=""
+POSTGRES_PASSWORD=""
+QUEUE_BULL_REDIS_HOST=""
+QUEUE_BULL_REDIS_PORT=""
+QUEUE_BULL_REDIS_PASSWORD=""
+
+usage() {
+cat <<EOF
+Uso: ${SCRIPT_NAME} [OPÇÕES]
+
+Gera o .env do stack n8n (compose_n8n/docker-compose.yml) a partir de
+credenciais de um Postgres e um Redis externos (stack postgres_redis,
+já provisionados em outro VPS) e sobe o compose com 'docker compose up -d'.
+
+Pergunta interativamente: domínio do n8n (roteado pelo Traefik externo),
+host/porta/banco/usuário/senha do PostgreSQL e host/porta/senha do Redis.
+As respostas ficam em ${COMPOSE_DIR:-<repo>/compose_n8n}/.setup.conf e são
+reaproveitadas em re-execuções.
+
+Pré-requisitos: Docker + plugin 'docker compose', e uma rede docker externa
+chamada 'traefik_public' apontando para um Traefik já em produção.
+
+OPÇÕES:
+  -h, --help        Ajuda
+  -v, --version     Versão
+
+Exemplos:
+  bash ${SCRIPT_NAME}
+EOF
+}
+
+log_info()  { printf '[INFO] %s\n' "$*" >&2; }
+log_warn()  { printf '[WARN] %s\n' "$*" >&2; }
+log_error() { printf '[ERROR] %s\n' "$*" >&2; }
+
+on_error() {
+    local line="$1"
+    log_error "Falha na etapa '${CURRENT_STEP}' (linha ${line})."
+    log_error "Corrija a causa e re-execute o script: as respostas salvas serão reaproveitadas."
+}
+trap 'on_error $LINENO' ERR
+
+# ------------------------------------------------------------------------------
+# Entrada interativa: funciona também via 'curl | bash' (lê de /dev/tty)
+ask() {
+    local msg="$1" reply=""
+    if [[ -t 0 ]]; then
+        read -rp "$msg" reply
+    elif [[ -e /dev/tty ]]; then
+        read -rp "$msg" reply < /dev/tty
+    else
+        log_error "Sem terminal para entrada interativa. Preencha ${SETUP_CONF} e re-execute."
+        exit 1
+    fi
+    printf '%s' "$reply"
+}
+
+# ask_secret MSG — como ask(), mas sem eco no terminal (senhas)
+ask_secret() {
+    local msg="$1" reply=""
+    if [[ -t 0 ]]; then
+        read -rsp "$msg" reply; echo >&2
+    elif [[ -e /dev/tty ]]; then
+        read -rsp "$msg" reply < /dev/tty; echo >&2
+    else
+        log_error "Sem terminal para entrada interativa. Preencha ${SETUP_CONF} e re-execute."
+        exit 1
+    fi
+    printf '%s' "$reply"
+}
+
+confirm() {
+    local reply
+    reply="$(ask "$1 [s/N] ")"
+    [[ "$reply" =~ ^[sSyY] ]]
+}
+
+# ------------------------------------------------------------------------------
+validate_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]
+}
+
+validate_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+}
+
+validate_not_empty() {
+    [[ -n "$1" ]]
+}
+
+# ------------------------------------------------------------------------------
+# Bootstrap: se não estamos dentro do repositório, baixa-o e re-executa de lá
+bootstrap_if_needed() {
+    local src="${BASH_SOURCE[0]:-}"
+    local script_dir=""
+
+    if [[ -n "$src" && "$src" != "bash" ]]; then
+        script_dir="$(cd "$(dirname "$src")" && pwd)"
+    fi
+
+    if [[ -n "$script_dir" && -f "${script_dir}/docker-compose.yml" ]]; then
+        REPO_DIR="$(cd "${script_dir}/.." && pwd)"
+        COMPOSE_DIR="$script_dir"
+        return 0
+    fi
+
+    log_info "Executando fora do repositório: baixando para ${INSTALL_DIR}..."
+
+    if ! command -v curl >/dev/null 2>&1; then
+        log_error "curl não encontrado. Instale curl e re-execute."
+        exit 1
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    curl -fsSL "$REPO_TARBALL_URL" | tar -xz --strip-components=1 -C "$INSTALL_DIR"
+    chmod +x "${INSTALL_DIR}/compose_n8n/"*.sh
+
+    log_info "Repositório extraído. Re-executando de ${INSTALL_DIR}..."
+    exec bash "${INSTALL_DIR}/compose_n8n/setup.sh" "$@"
+}
+
+# ------------------------------------------------------------------------------
+step_preflight() {
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "Docker não encontrado. Instale o Docker Engine e re-execute."
+        return 1
+    fi
+
+    if ! docker compose version >/dev/null 2>&1; then
+        log_error "Plugin 'docker compose' não encontrado. Instale docker-compose-plugin e re-execute."
+        return 1
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        log_error "Não foi possível falar com o daemon do Docker (permissão? serviço parado?)."
+        log_error "Adicione seu usuário ao grupo 'docker' ou execute com sudo."
+        return 1
+    fi
+
+    log_info "Docker OK: $(docker --version)"
+}
+
+# ------------------------------------------------------------------------------
+load_conf() {
+    if [[ -r "$SETUP_CONF" ]]; then
+        # shellcheck disable=SC1090
+        . "$SETUP_CONF"
+    fi
+}
+
+save_conf() {
+    umask 077
+    cat > "$SETUP_CONF" <<EOF
+# Gerado por setup.sh — respostas do provisionamento (reutilizadas em re-execuções)
+DOMAIN="${DOMAIN}"
+DB_POSTGRESDB_HOST="${DB_POSTGRESDB_HOST}"
+DB_POSTGRESDB_PORT="${DB_POSTGRESDB_PORT}"
+POSTGRES_DB="${POSTGRES_DB}"
+POSTGRES_USER="${POSTGRES_USER}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD}"
+QUEUE_BULL_REDIS_HOST="${QUEUE_BULL_REDIS_HOST}"
+QUEUE_BULL_REDIS_PORT="${QUEUE_BULL_REDIS_PORT}"
+QUEUE_BULL_REDIS_PASSWORD="${QUEUE_BULL_REDIS_PASSWORD}"
+EOF
+    log_info "Respostas salvas em ${SETUP_CONF}"
+}
+
+step_inputs() {
+    load_conf
+
+    while [[ -z "$DOMAIN" ]]; do
+        DOMAIN="$(ask "Domínio do n8n (ex.: n8n.seudominio.com): ")"
+        validate_domain "$DOMAIN" || {
+            log_warn "Domínio inválido: '${DOMAIN}'"
+            DOMAIN=""
+        }
+    done
+
+    log_info "--- PostgreSQL externo (stack postgres_redis) ---"
+
+    while [[ -z "$DB_POSTGRESDB_HOST" ]]; do
+        DB_POSTGRESDB_HOST="$(ask "Host do PostgreSQL (domínio do VPS de banco): ")"
+        validate_not_empty "$DB_POSTGRESDB_HOST" || DB_POSTGRESDB_HOST=""
+    done
+
+    while ! validate_port "$DB_POSTGRESDB_PORT"; do
+        DB_POSTGRESDB_PORT="$(ask "Porta do PostgreSQL [5432]: ")"
+        [[ -z "$DB_POSTGRESDB_PORT" ]] && DB_POSTGRESDB_PORT="5432"
+        validate_port "$DB_POSTGRESDB_PORT" || {
+            log_warn "Porta inválida: '${DB_POSTGRESDB_PORT}'"
+            DB_POSTGRESDB_PORT=""
+        }
+    done
+
+    while [[ -z "$POSTGRES_DB" ]]; do
+        POSTGRES_DB="$(ask "Nome do banco (DB_NAME de create_app_user.sh): ")"
+        validate_not_empty "$POSTGRES_DB" || POSTGRES_DB=""
+    done
+
+    while [[ -z "$POSTGRES_USER" ]]; do
+        POSTGRES_USER="$(ask "Usuário do PostgreSQL (DB_USER de create_app_user.sh): ")"
+        validate_not_empty "$POSTGRES_USER" || POSTGRES_USER=""
+    done
+
+    while [[ -z "$POSTGRES_PASSWORD" ]]; do
+        POSTGRES_PASSWORD="$(ask_secret "Senha do PostgreSQL (DB_PASSWORD): ")"
+        validate_not_empty "$POSTGRES_PASSWORD" || POSTGRES_PASSWORD=""
+    done
+
+    log_info "--- Redis externo (stack postgres_redis, instância per-app com TLS) ---"
+
+    while [[ -z "$QUEUE_BULL_REDIS_HOST" ]]; do
+        QUEUE_BULL_REDIS_HOST="$(ask "Host do Redis [${DB_POSTGRESDB_HOST}]: ")"
+        [[ -z "$QUEUE_BULL_REDIS_HOST" ]] && QUEUE_BULL_REDIS_HOST="$DB_POSTGRESDB_HOST"
+    done
+
+    while ! validate_port "$QUEUE_BULL_REDIS_PORT"; do
+        QUEUE_BULL_REDIS_PORT="$(ask "Porta do Redis (REDIS_PORT de create_app_redis.sh) [6380]: ")"
+        [[ -z "$QUEUE_BULL_REDIS_PORT" ]] && QUEUE_BULL_REDIS_PORT="6380"
+        validate_port "$QUEUE_BULL_REDIS_PORT" || {
+            log_warn "Porta inválida: '${QUEUE_BULL_REDIS_PORT}'"
+            QUEUE_BULL_REDIS_PORT=""
+        }
+    done
+
+    while [[ -z "$QUEUE_BULL_REDIS_PASSWORD" ]]; do
+        QUEUE_BULL_REDIS_PASSWORD="$(ask_secret "Senha do Redis (REDIS_PASSWORD de create_app_redis.sh): ")"
+        validate_not_empty "$QUEUE_BULL_REDIS_PASSWORD" || QUEUE_BULL_REDIS_PASSWORD=""
+    done
+
+    save_conf
+}
+
+# ------------------------------------------------------------------------------
+# Reaproveita N8N_ENCRYPTION_KEY de um .env existente; gera uma nova só na
+# primeira execução (a chave NUNCA pode mudar depois de criada).
+existing_encryption_key() {
+    [[ -r "$ENV_FILE" ]] || return 0
+    grep -oP '^N8N_ENCRYPTION_KEY=\K.*' "$ENV_FILE" || true
+}
+
+step_generate_env() {
+    local encryption_key
+    encryption_key="$(existing_encryption_key)"
+    if [[ -z "$encryption_key" ]]; then
+        encryption_key="$(openssl rand -hex 32)"
+        log_info "N8N_ENCRYPTION_KEY gerada (primeira execução)."
+    else
+        log_info "N8N_ENCRYPTION_KEY reaproveitada do .env existente."
+    fi
+
+    if [[ -f "$ENV_FILE" ]]; then
+        confirm "Já existe um .env em ${ENV_FILE}. Sobrescrever com os valores informados?" || {
+            log_info "Mantendo .env existente."
+            return 0
+        }
+    fi
+
+    umask 077
+    cat > "$ENV_FILE" <<EOF
+# Gerado por setup.sh — não editar manualmente, re-execute o script para atualizar
+DOMAIN=${DOMAIN}
+
+DB_TYPE=postgresdb
+DB_POSTGRESDB_HOST=${DB_POSTGRESDB_HOST}
+DB_POSTGRESDB_PORT=${DB_POSTGRESDB_PORT}
+POSTGRES_USER=${POSTGRES_USER}
+POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+POSTGRES_DB=${POSTGRES_DB}
+DB_POSTGRESDB_SSL_ENABLED=true
+DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=true
+DB_POSTGRESDB_SSL_CA_FILE=
+
+N8N_ENCRYPTION_KEY=${encryption_key}
+
+EXECUTIONS_MODE=queue
+QUEUE_BULL_REDIS_HOST=${QUEUE_BULL_REDIS_HOST}
+QUEUE_BULL_REDIS_PORT=${QUEUE_BULL_REDIS_PORT}
+QUEUE_BULL_REDIS_PASSWORD=${QUEUE_BULL_REDIS_PASSWORD}
+QUEUE_BULL_REDIS_TLS=true
+
+GENERIC_TIMEZONE=America/Sao_Paulo
+N8N_PROTOCOL=https
+N8N_PORT=5678
+N8N_PROXY_HOPS=1
+N8N_RUNNERS_ENABLED=true
+EOF
+    log_info ".env gerado em ${ENV_FILE}"
+}
+
+# ------------------------------------------------------------------------------
+step_up() {
+    if ! docker network inspect traefik_public >/dev/null 2>&1; then
+        log_error "Rede docker 'traefik_public' não encontrada."
+        log_error "Suba o Traefik externo (que cria essa rede) antes de continuar."
+        return 1
+    fi
+
+    (cd "$COMPOSE_DIR" && docker compose up -d)
+    log_info "Stack n8n iniciado."
+}
+
+# ------------------------------------------------------------------------------
+step_summary() {
+    echo
+    echo "=============================================================="
+    echo " n8n provisionado"
+    echo "=============================================================="
+    echo " URL:        https://${DOMAIN}"
+    echo " .env:       ${ENV_FILE}"
+    echo " Respostas:  ${SETUP_CONF}"
+    echo
+    (cd "$COMPOSE_DIR" && docker compose ps)
+    echo
+    echo " Logs:"
+    echo "   cd ${COMPOSE_DIR} && docker compose logs -f n8n"
+    echo "=============================================================="
+}
+
+# ------------------------------------------------------------------------------
+run_step() {
+    local step="$1"
+    CURRENT_STEP="$step"
+    log_info "==> Etapa: ${step}"
+    "step_${step}"
+}
+
+main() {
+    local -a orig_args=("$@")
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -v|--version) echo "$SCRIPT_VERSION"; exit 0 ;;
+            *) log_error "Opção desconhecida: $1"; usage; exit 2 ;;
+        esac
+    done
+
+    bootstrap_if_needed "${orig_args[@]}"
+
+    SETUP_CONF="${COMPOSE_DIR}/.setup.conf"
+    ENV_FILE="${COMPOSE_DIR}/.env"
+
+    log_info "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} — $(date -Is) ==="
+    log_info "Repositório: ${REPO_DIR}"
+
+    local step
+    for step in "${STEP_SEQUENCE[@]}"; do
+        run_step "$step"
+    done
+}
+
+main "$@"

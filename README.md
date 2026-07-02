@@ -24,10 +24,10 @@ Each stack is designed to be:
 
 Currently, the repository includes the following robust setup stacks:
 
-### [postgres_redis](./postgres_redis/README.md)
-A high-performance, secure database and caching server stack. It provisions **PostgreSQL 17** and **Redis 8**, fully secured with **Let's Encrypt TLS certificates**, **UFW**, and **Fail2Ban**. It features per-application Redis isolation and aggressive hardware tuning for NVMe storage environments.
-
-👉 **[Read the full Architecture & Operations Guide for `postgres_redis`](./postgres_redis/README.md)**
+| Stack | Description | Documentation |
+|-------|-------------|---------------|
+| **`postgres_redis`** | A high-performance, secure database and caching server stack. Provisions **PostgreSQL 17** and **Redis 8**, fully secured with Let's Encrypt TLS, UFW, and Fail2Ban. Features per-application Redis isolation and NVMe hardware tuning. | [🔗 Architecture & Ops Guide](./postgres_redis/README.md) |
+| **`compose_n8n`** | A Docker Compose stack for **n8n** (main + worker, queue mode), routed by an external Traefik. Connects to external database services (`postgres_redis` on a separate VPS). Includes an interactive `setup.sh` to generate the `.env` automatically. | [🔗 Architecture & Ops Guide](./compose_n8n/README.md) |
 
 ---
 

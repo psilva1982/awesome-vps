@@ -1,0 +1,83 @@
+name: workflow
+
+networks:
+  traefik_public:
+    external: true
+  internal:
+
+volumes:
+  n8n_data:
+
+services:
+  n8n:
+    image: n8nio/n8n:2.28.2
+    restart: unless-stopped
+    environment:
+      EXECUTIONS_MODE: ${EXECUTIONS_MODE}
+      QUEUE_BULL_REDIS_HOST: ${QUEUE_BULL_REDIS_HOST}
+      QUEUE_BULL_REDIS_PORT: ${QUEUE_BULL_REDIS_PORT:-6380}
+      QUEUE_BULL_REDIS_PASSWORD: ${QUEUE_BULL_REDIS_PASSWORD}
+      QUEUE_BULL_REDIS_TLS: ${QUEUE_BULL_REDIS_TLS:-true}
+      DB_TYPE: ${DB_TYPE}
+      DB_POSTGRESDB_HOST: ${DB_POSTGRESDB_HOST}
+      DB_POSTGRESDB_PORT: ${DB_POSTGRESDB_PORT:-5432}
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SSL_ENABLED: ${DB_POSTGRESDB_SSL_ENABLED:-true}
+      DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED: ${DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED:-true}
+      DB_POSTGRESDB_SSL_CA_FILE: ${DB_POSTGRESDB_SSL_CA_FILE:-}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      N8N_HOST: ${DOMAIN}
+      N8N_PROTOCOL: ${N8N_PROTOCOL}
+      N8N_PORT: ${N8N_PORT}
+      WEBHOOK_URL: https://${DOMAIN}/
+      N8N_PROXY_HOPS: ${N8N_PROXY_HOPS}
+      N8N_RUNNERS_ENABLED: ${N8N_RUNNERS_ENABLED}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./certs:/certs:ro
+    networks:
+      - traefik_public
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik_public"
+      - "traefik.http.routers.n8n.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=letsencrypt"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+
+  n8n-worker:
+    image: n8nio/n8n:2.28.2
+    restart: unless-stopped
+    command: worker
+    environment:
+      EXECUTIONS_MODE: ${EXECUTIONS_MODE}
+      QUEUE_BULL_REDIS_HOST: ${QUEUE_BULL_REDIS_HOST}
+      QUEUE_BULL_REDIS_PORT: ${QUEUE_BULL_REDIS_PORT:-6380}
+      QUEUE_BULL_REDIS_PASSWORD: ${QUEUE_BULL_REDIS_PASSWORD}
+      QUEUE_BULL_REDIS_TLS: ${QUEUE_BULL_REDIS_TLS:-true}
+      DB_TYPE: ${DB_TYPE}
+      DB_POSTGRESDB_HOST: ${DB_POSTGRESDB_HOST}
+      DB_POSTGRESDB_PORT: ${DB_POSTGRESDB_PORT:-5432}
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SSL_ENABLED: ${DB_POSTGRESDB_SSL_ENABLED:-true}
+      DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED: ${DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED:-true}
+      DB_POSTGRESDB_SSL_CA_FILE: ${DB_POSTGRESDB_SSL_CA_FILE:-}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      N8N_RUNNERS_ENABLED: ${N8N_RUNNERS_ENABLED}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./certs:/certs:ro
+    networks:
+      - internal
+    depends_on:
+      n8n:
+        condition: service_started
+    deploy:
+      replicas: 2
