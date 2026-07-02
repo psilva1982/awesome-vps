@@ -7,8 +7,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/psilva1982/awesome-vps/main/postgres_redis/setup.sh -o setup.sh
 #   sudo bash setup.sh
 #
-# O script baixa o repositório completo para /opt/awesome-vps e se
-# re-executa de lá. É idempotente: re-executar retoma de onde parou.
+# O script baixa apenas o conteúdo de postgres_redis/ para
+# /opt/awesome-vps-postgres_redis e se re-executa de lá. É idempotente:
+# re-executar retoma de onde parou.
 #
 # POSIX Note: This script currently relies on bash-specific features (arrays, 
 # [[ ]], process substitution). For strict POSIX compliance (posix-shell-pro), 
@@ -22,7 +23,7 @@ readonly SCRIPT_NAME="${0##*/}"
 readonly SCRIPT_VERSION="1.2.0"
 
 readonly REPO_TARBALL_URL="https://github.com/psilva1982/awesome-vps/archive/refs/heads/main.tar.gz"
-readonly INSTALL_DIR="/opt/awesome-vps"
+readonly INSTALL_DIR="/opt/awesome-vps-postgres_redis"
 readonly SETUP_CONF="/etc/vps-setup.conf"
 readonly LOG_FILE="/var/log/vps-setup.log"
 
@@ -157,7 +158,7 @@ bootstrap_if_needed() {
         return 0
     fi
 
-    log_info "Executando fora do repositório: baixando para ${INSTALL_DIR}..."
+    log_info "Executando fora do repositório: baixando postgres_redis/ para ${INSTALL_DIR}..."
 
     if ! command -v curl >/dev/null 2>&1; then
         apt-get update -qq
@@ -165,11 +166,12 @@ bootstrap_if_needed() {
     fi
 
     mkdir -p "$INSTALL_DIR"
-    curl -fsSL "$REPO_TARBALL_URL" | tar -xz --strip-components=1 -C "$INSTALL_DIR"
-    chmod +x "${INSTALL_DIR}/postgres_redis/"*.sh "${INSTALL_DIR}/postgres_redis/scripts/"*.sh
+    curl -fsSL "$REPO_TARBALL_URL" | tar -xz --wildcards --strip-components=2 -C "$INSTALL_DIR" '*/postgres_redis/*'
+    chmod +x "${INSTALL_DIR}/"*.sh "${INSTALL_DIR}/scripts/"*.sh
 
-    log_info "Repositório extraído. Re-executando de ${INSTALL_DIR}..."
-    exec bash "${INSTALL_DIR}/postgres_redis/setup.sh" "$@"
+    REPO_DIR="$INSTALL_DIR"
+    log_info "postgres_redis/ extraído. Re-executando de ${INSTALL_DIR}..."
+    exec bash "${INSTALL_DIR}/setup.sh" "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -725,8 +727,8 @@ resolve_repo_dir_for_purge() {
 
     if [[ -n "$script_dir" && -f "${script_dir}/scripts/create_app_user.sh" ]]; then
         REPO_DIR="$script_dir"
-    elif [[ -f "${INSTALL_DIR}/postgres_redis/scripts/create_app_user.sh" ]]; then
-        REPO_DIR="${INSTALL_DIR}/postgres_redis"
+    elif [[ -f "${INSTALL_DIR}/scripts/create_app_user.sh" ]]; then
+        REPO_DIR="$INSTALL_DIR"
     fi
 }
 

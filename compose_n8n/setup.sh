@@ -11,8 +11,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/psilva1982/awesome-vps/main/compose_n8n/setup.sh -o setup.sh
 #   bash setup.sh
 #
-# O script baixa o repositório completo para /opt/awesome-vps e se
-# re-executa de lá. É idempotente: re-executar reaproveita as respostas
+# O script baixa apenas o conteúdo de compose_n8n/ para /opt/awesome-vps-n8n
+# e se re-executa de lá. É idempotente: re-executar reaproveita as respostas
 # salvas e não sobrescreve o .env sem confirmação.
 #
 # POSIX Note: This script currently relies on bash-specific features (arrays,
@@ -24,18 +24,23 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 
 readonly REPO_TARBALL_URL="https://github.com/psilva1982/awesome-vps/archive/refs/heads/main.tar.gz"
-readonly INSTALL_DIR="/opt/awesome-vps"
+readonly INSTALL_DIR="/opt/awesome-vps-n8n"
+# Nome do projeto compose (ver 'name:' em docker-compose.yml) — usado no purge
+# como fallback quando o docker-compose.yml não está disponível localmente.
+readonly COMPOSE_PROJECT_NAME="workflow"
 
 REPO_DIR=""
 COMPOSE_DIR=""
 SETUP_CONF=""
 ENV_FILE=""
 CURRENT_STEP="(inicialização)"
+PURGE_FORCE=false
 
 readonly STEP_SEQUENCE=(preflight inputs generate_env up summary)
+readonly PURGE_SEQUENCE=(confirm down env state)
 
 DOMAIN=""
 DB_POSTGRESDB_HOST=""
@@ -66,9 +71,19 @@ chamada 'traefik_public' apontando para um Traefik já em produção.
 OPÇÕES:
   -h, --help        Ajuda
   -v, --version     Versão
+  --purge           DESTRUTIVO: desfaz a instalação do stack n8n — para e
+                    remove os containers, a rede interna e o volume n8n_data
+                    (TODOS os workflows, credenciais e execuções salvos no
+                    n8n), além de .env e .setup.conf.
+                    NÃO afeta o Postgres/Redis externos (stack postgres_redis)
+                    nem a rede 'traefik_public'. Pede confirmação (domínio ou
+                    'DESINSTALAR'), a menos que -f/--force seja usado.
+  -f, --force       Com --purge: pula a confirmação (útil para automação)
 
 Exemplos:
   bash ${SCRIPT_NAME}
+  bash ${SCRIPT_NAME} --purge
+  bash ${SCRIPT_NAME} --purge --force
 EOF
 }
 
@@ -142,12 +157,12 @@ bootstrap_if_needed() {
     fi
 
     if [[ -n "$script_dir" && -f "${script_dir}/docker-compose.yml" ]]; then
-        REPO_DIR="$(cd "${script_dir}/.." && pwd)"
+        REPO_DIR="$script_dir"
         COMPOSE_DIR="$script_dir"
         return 0
     fi
 
-    log_info "Executando fora do repositório: baixando para ${INSTALL_DIR}..."
+    log_info "Executando fora do repositório: baixando compose_n8n/ para ${INSTALL_DIR}..."
 
     if ! command -v curl >/dev/null 2>&1; then
         log_error "curl não encontrado. Instale curl e re-execute."
@@ -155,11 +170,12 @@ bootstrap_if_needed() {
     fi
 
     mkdir -p "$INSTALL_DIR"
-    curl -fsSL "$REPO_TARBALL_URL" | tar -xz --strip-components=1 -C "$INSTALL_DIR"
-    chmod +x "${INSTALL_DIR}/compose_n8n/"*.sh
+    curl -fsSL "$REPO_TARBALL_URL" | tar -xz --wildcards --strip-components=2 -C "$INSTALL_DIR" '*/compose_n8n/*'
+    chmod +x "${INSTALL_DIR}/"*.sh
 
-    log_info "Repositório extraído. Re-executando de ${INSTALL_DIR}..."
-    exec bash "${INSTALL_DIR}/compose_n8n/setup.sh" "$@"
+    REPO_DIR="$INSTALL_DIR"
+    log_info "compose_n8n/ extraído. Re-executando de ${INSTALL_DIR}..."
+    exec bash "${INSTALL_DIR}/setup.sh" "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -360,6 +376,132 @@ step_summary() {
     echo "=============================================================="
 }
 
+# ==============================================================================
+# PURGE — desfaz a instalação do stack n8n, inclusive dados (--purge)
+# ==============================================================================
+
+# Mesma detecção de COMPOSE_DIR do bootstrap_if_needed(), sem baixar o
+# tarball: se o docker-compose.yml não for encontrado nem localmente nem em
+# INSTALL_DIR, purge_down() cai para comandos docker diretos (fallback).
+resolve_compose_dir_for_purge() {
+    local src="${BASH_SOURCE[0]:-}"
+    local script_dir=""
+
+    if [[ -n "$src" && "$src" != "bash" ]]; then
+        script_dir="$(cd "$(dirname "$src")" && pwd)"
+    fi
+
+    if [[ -n "$script_dir" && -f "${script_dir}/docker-compose.yml" ]]; then
+        COMPOSE_DIR="$script_dir"
+    elif [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+        COMPOSE_DIR="$INSTALL_DIR"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+purge_confirm() {
+    load_conf
+
+    if [[ "$PURGE_FORCE" == true ]]; then
+        log_warn "Modo --force: pulando confirmação de purge."
+        return 0
+    fi
+
+    log_warn "=============================================================="
+    log_warn " ATENÇÃO: isto vai REMOVER o stack n8n deste VPS:"
+    log_warn "  - Containers do compose (n8n, n8n-worker) e a rede interna"
+    log_warn "  - O volume n8n_data — TODOS os workflows, credenciais e"
+    log_warn "    execuções salvos no n8n serão PERDIDOS"
+    log_warn "  - Os arquivos .env e .setup.conf"
+    log_warn ""
+    log_warn " NÃO afeta: o Postgres/Redis externos (stack postgres_redis)"
+    log_warn " nem a rede 'traefik_public' (compartilhada com o Traefik e"
+    log_warn " possivelmente outras stacks)."
+    log_warn "=============================================================="
+
+    local expected="${DOMAIN:-}"
+    local prompt
+    if [[ -n "$expected" ]]; then
+        prompt="Digite o domínio configurado (${expected}) ou 'DESINSTALAR' para confirmar: "
+    else
+        prompt="Domínio não encontrado em ${SETUP_CONF}. Digite 'DESINSTALAR' para confirmar: "
+    fi
+
+    local reply
+    reply="$(ask "$prompt")"
+
+    if [[ "$reply" == "DESINSTALAR" ]] || { [[ -n "$expected" ]] && [[ "$reply" == "$expected" ]]; }; then
+        return 0
+    fi
+
+    log_error "Confirmação não corresponde. Purge cancelado."
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+purge_down() {
+    if [[ -n "$COMPOSE_DIR" && -f "${COMPOSE_DIR}/docker-compose.yml" ]]; then
+        (cd "$COMPOSE_DIR" && docker compose down --volumes --remove-orphans)
+        log_info "Containers, rede interna e volume n8n_data removidos via docker compose."
+        return 0
+    fi
+
+    log_warn "docker-compose.yml não encontrado; removendo pelo nome do projeto '${COMPOSE_PROJECT_NAME}'."
+
+    local containers
+    containers="$(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}")"
+    if [[ -n "$containers" ]]; then
+        # shellcheck disable=SC2086
+        docker rm -f $containers >/dev/null
+    fi
+
+    docker volume rm -f "${COMPOSE_PROJECT_NAME}_n8n_data" >/dev/null 2>&1 || true
+    docker network rm "${COMPOSE_PROJECT_NAME}_internal" >/dev/null 2>&1 || true
+    log_info "Containers, rede interna e volume n8n_data removidos (fallback via docker)."
+}
+
+# ------------------------------------------------------------------------------
+purge_env() {
+    if [[ -n "$ENV_FILE" ]]; then
+        rm -f "$ENV_FILE"
+        log_info ".env removido (${ENV_FILE})."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+purge_state() {
+    if [[ -n "$SETUP_CONF" ]]; then
+        rm -f "$SETUP_CONF"
+        log_info "Respostas salvas removidas (${SETUP_CONF})."
+    fi
+    if [[ -d "$INSTALL_DIR" ]]; then
+        log_warn "Cópia do repositório em ${INSTALL_DIR} não foi removida (pode estar em uso). Remova manualmente se desejar."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+run_purge_step() {
+    local step="$1"
+    CURRENT_STEP="purge:${step}"
+    log_info "==> Purge: ${step}"
+    "purge_${step}"
+}
+
+do_purge() {
+    resolve_compose_dir_for_purge
+    if [[ -n "$COMPOSE_DIR" ]]; then
+        SETUP_CONF="${COMPOSE_DIR}/.setup.conf"
+        ENV_FILE="${COMPOSE_DIR}/.env"
+    fi
+
+    local step
+    for step in "${PURGE_SEQUENCE[@]}"; do
+        run_purge_step "$step"
+    done
+
+    log_info "Purge concluído."
+}
+
 # ------------------------------------------------------------------------------
 run_step() {
     local step="$1"
@@ -369,15 +511,24 @@ run_step() {
 }
 
 main() {
+    local purge=false
     local -a orig_args=("$@")
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) usage; exit 0 ;;
             -v|--version) echo "$SCRIPT_VERSION"; exit 0 ;;
+            --purge) purge=true; shift ;;
+            -f|--force) PURGE_FORCE=true; shift ;;
             *) log_error "Opção desconhecida: $1"; usage; exit 2 ;;
         esac
     done
+
+    if [[ "$purge" == true ]]; then
+        log_info "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} — purge — $(date -Is) ==="
+        do_purge
+        return 0
+    fi
 
     bootstrap_if_needed "${orig_args[@]}"
 

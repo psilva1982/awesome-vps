@@ -8,6 +8,7 @@ shopt -s inherit_errexit
 
 readonly SCRIPT_NAME="${0##*/}"
 readonly SCRIPT_VERSION="1.2.0"
+readonly VPS_SETUP_CONF="/etc/vps-setup.conf"
 
 usage() {
 cat <<EOF
@@ -158,12 +159,23 @@ main() {
     log_info "Criando banco..."
     create_postgres_database "$db_name" "$username"
 
-    local connection_string="postgresql://${username}:${password}@localhost:5432/${db_name}?sslmode=require"
+    # Conexões remotas só são aceitas via hostssl (setup.sh); o cert TLS é
+    # emitido para o DOMAIN do vps-setup.conf, então a URL deve usar esse
+    # host em vez de 'localhost' para o hostname bater com o certificado.
+    local host="localhost"
+    if [[ -r "$VPS_SETUP_CONF" ]]; then
+        local conf_domain
+        conf_domain=$(grep -oP '^DOMAIN="\K[^"]+' "$VPS_SETUP_CONF" || true)
+        [[ -n "$conf_domain" ]] && host="$conf_domain"
+    fi
+
+    local connection_string="postgresql://${username}:${password}@${host}:5432/${db_name}?sslmode=require"
 
     if [[ -n "$output_file" ]]; then
         umask 177
         cat > "$output_file" <<EOF
 # PostgreSQL credentials
+DB_HOST=${host}
 DB_NAME=${db_name}
 DB_USER=${username}
 DB_PASSWORD=${password}
@@ -174,6 +186,7 @@ EOF
         echo "========================================"
         echo " PostgreSQL - ${app_name}"
         echo "========================================"
+        echo "HOST: $host"
         echo "USER: $username"
         echo "DB:   $db_name"
         echo "PASS: $password"
